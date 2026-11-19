@@ -2,6 +2,9 @@ TRABALHO DE IA
 
 GRUPO: 
     Roberto Rigo
+    Gerson Belniowski Jr.
+    Dnate Krol Simba 
+    Guilherme G. 
 
 
 Especificações:
