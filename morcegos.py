@@ -1,19 +1,22 @@
 """
 Reconhecimento de padrões - identificação de morcegos (Chiroptera) em 8426 genomas mitocondriais.
+Versão: SVM com kernel RBF
 Estratégia: self-training / aprendizado semissupervisionado com curadoria humana por rodadas.
+
+Uso:  python3 morcegos_svm.py [pasta_dos_dados]      (padrão: ./data, com Names.txt e wpc50.dat)
+Saída: pasta saida_svm/ (classes.txt, indices_morcegos.txt, classificacao_final.csv, modelo.joblib)
 """
-import os, sys, re, numpy as np, pandas as pd, joblib
-from sklearn.ensemble import RandomForestClassifier
+import os, sys, warnings, numpy as np, pandas as pd, joblib
 from sklearn.svm import SVC
-from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.neighbors import NearestNeighbors
+from sklearn.model_selection import StratifiedKFold, GroupKFold, cross_val_predict
 from sklearn.metrics import (accuracy_score, precision_score, recall_score,
                              f1_score, confusion_matrix)
+warnings.filterwarnings("ignore")
 
 DIR = (sys.argv[1] if len(sys.argv) > 1 else "./data") + "/"   # pasta com Names.txt e wpc50.dat
-CLASSIFICADOR = "svm"    # "svm" (recomendado) ou "lr" (regressão logística)
-OUT = "saida/"; os.makedirs(OUT, exist_ok=True)
+OUT = "saida_svm/"; os.makedirs(OUT, exist_ok=True)
 SEED = 42
 rng = np.random.default_rng(SEED)
 
@@ -40,9 +43,8 @@ y[np.isin(genus, list(SEED_POS))] = 1
 y[np.isin(genus, list(SEED_NEG))] = 0
 print(f"Semente: {np.sum(y==1)} positivos, {np.sum(y==0)} negativos, {np.sum(y==-1)} não rotulados")
 
-#3. Enriquecimento: SMOTE simples (interpolação entre positivos vizinhos)
+# ---------- 3. Enriquecimento: SMOTE simples (interpolação entre positivos vizinhos) ----------
 def smote(Xp, n_new, k=5):
-    from sklearn.neighbors import NearestNeighbors
     nn = NearestNeighbors(n_neighbors=min(k + 1, len(Xp))).fit(Xp)
     idx = nn.kneighbors(Xp, return_distance=False)[:, 1:]
     out = []
@@ -51,47 +53,42 @@ def smote(Xp, n_new, k=5):
         out.append(Xp[i] + rng.random() * (Xp[j] - Xp[i]))
     return np.array(out)
 
+# Classificador (único trecho que muda entre as três versões)
+def novo_classificador():
+    return SVC(kernel="rbf", C=10, gamma="scale", probability=True, class_weight="balanced", random_state=SEED)
+
 def fit_model(Xl, yl):
     pos = Xl[yl == 1]
     n_new = max(0, (yl == 0).sum() - len(pos))
     Xa = np.vstack([Xl, smote(pos, n_new)]); ya = np.r_[yl, np.ones(n_new, int)]
-    if CLASSIFICADOR == "lr":
-        return LogisticRegression(C=1.0, max_iter=3000, class_weight="balanced").fit(Xa, ya)
-    return SVC(kernel="rbf", C=10, gamma="scale", probability=True,
-               class_weight="balanced", random_state=SEED).fit(Xa, ya)
+    return novo_classificador().fit(Xa, ya)
 
-# 4. Self-training em rodadas com curadoria humana
-# Após cada rodada, os candidatos são pesquisados (NCBI Taxonomy / literatura) e decididos aqui.
+# ---------- 4. Self-training em rodadas com curadoria humana ----------
+# thr = limiar de probabilidade para listar candidatos;
+# ok  = gêneros candidatos confirmados como Chiroptera após pesquisa (NCBI Taxonomy / literatura).
+# Todo candidato listado e NÃO confirmado em "ok" é considerado rejeitado (negativo).
 CURADORIA = {
-    1: dict(thr=0.5,
-            ok={"Pteronotus","Murina","Vespertilio","Anoura","Brachyphylla","Carollia","Chalinolobus",
-                "Corynorhinus","Cynopterus","Epomophorus","Hypsugo","Lasiurus","Lophostoma","Micronycteris",
-                "Mystacina","Nyctalus","Rhinophylla","Rousettus","Saccopteryx","Sturnira","Tonatia","Vampyrum"},
-            no={"Hylomys","Phaner","Trichechus"}),
-    2: dict(thr=0.05, ok=set(),   # todos revisados: nenhum é Chiroptera -> negativos
-            no={"Bothus","Camelus","Hemiechinus","Hoploplana","Hystrix","Indotyphlops","Lipotes",
-                "Scapanulus","Uropsilus","Urotrichus"}),
+    1: dict(thr=0.5, ok={"Anoura", "Brachyphylla", "Carollia", "Chalinolobus", "Corynorhinus", "Cynopterus", "Epomophorus", "Hypsugo", "Lasiurus", "Lophostoma", "Micronycteris", "Murina", "Mystacina", "Nyctalus", "Pteronotus", "Rhinophylla", "Rousettus", "Saccopteryx", "Sturnira", "Tonatia", "Vampyrum", "Vespertilio"}),
+    2: dict(thr=0.05, ok=set()),
 }
-import warnings; warnings.filterwarnings("ignore")
-historico = []
-for rodada in range(1, 7):
+
+for rodada, cfg in CURADORIA.items():
     lab = y != -1
     model = fit_model(Xs[lab], y[lab])
     unl = np.where(y == -1)[0]
     p = model.predict_proba(Xs[unl])[:, 1]
-    cfg = CURADORIA.get(rodada, dict(thr=0.5, ok=set(), no=set()))
     cand = unl[p >= cfg["thr"]]
     resumo = pd.Series(genus[cand]).value_counts()
     print(f"\n=== Rodada {rodada}: {lab.sum()} rotulados (pos={np.sum(y==1)}); {len(cand)} candidatos p>={cfg['thr']} ===")
-    print(", ".join(f"{g}({n})" for g, n in resumo.items()))
+    print(", ".join(f"{g}({n})" for g, n in resumo.head(40).items()) + (" ..." if len(resumo) > 40 else ""))
     y[unl[p < 0.01]] = 0                                   # negativos confiantes
     y[np.isin(genus, list(cfg["ok"])) & (y == -1)] = 1     # positivos curados
-    y[np.isin(genus, list(cfg["no"])) & (y == -1)] = 0     # falsos positivos curados
-    historico.append((rodada, int(np.sum(y == 1))))
-    if rodada >= max(CURADORIA) and not cfg["ok"]: break
+    rejeitados = cand[y[cand] == -1]                       # candidatos não confirmados
+    y[rejeitados] = 0                                      # falsos positivos curados
+    print(f"-> confirmados: {len(cfg['ok'])} gêneros | rejeitados: {len(set(genus[rejeitados]))} gêneros")
 
 # ---------- 5. Rótulo final ----------
-y_final = np.where(y == 1, 1, 0)         # restantes não rotulados = 0 (nenhum candidato sobrou)
+y_final = np.where(y == 1, 1, 0)         # restantes não rotulados = 0
 idx_pos = np.where(y_final == 1)[0] + 1  # números de ordem (base 1)
 print(f"\nTotal de morcegos: {y_final.sum()} de {len(y_final)}")
 pd.DataFrame({"indice": np.arange(1, len(names)+1), "nome": names, "classe": y_final})
@@ -103,29 +100,24 @@ df_morcegos = pd.DataFrame({
     "especie": np.array(names)[y_final == 1]
 })
 df_morcegos.to_csv(OUT + "indices_morcegos.txt", sep="\t", index=False, header=False)
+print("\nMorcegos identificados (índice  espécie):")
+print(df_morcegos.to_string(index=False, header=False))
 
 # ---------- 6. Desempenho ----------
-from sklearn.model_selection import GroupKFold
 def relatorio(titulo, yt, yp):
     tn, fp, fn, tp = confusion_matrix(yt, yp).ravel()
     print(f"{titulo}: acc={accuracy_score(yt,yp):.4f} sens={recall_score(yt,yp):.4f} "
           f"prec={precision_score(yt,yp):.4f} F1={f1_score(yt,yp):.4f}  [TP={tp} FP={fp} FN={fn} TN={tn}]")
 
+NOME = "SVM com kernel RBF"
 print("\n--- Validação cruzada estratificada 10-fold no conjunto final ---")
 skf = StratifiedKFold(10, shuffle=True, random_state=SEED)
-for nome, clf in {
-    "SVM-RBF": SVC(kernel="rbf", C=10, class_weight="balanced"),
-    "RandomForest": RandomForestClassifier(300, class_weight="balanced", random_state=SEED, n_jobs=-1),
-    "LogReg": LogisticRegression(max_iter=2000, class_weight="balanced"),
-}.items():
-    relatorio(nome, y_final, cross_val_predict(clf, Xs, y_final, cv=skf))
+relatorio(NOME, y_final, cross_val_predict(novo_classificador(), Xs, y_final, cv=skf))
 
 print("\n--- Validação por GÊNERO (GroupKFold): gênero nunca visto no treino ---")
-gkf = GroupKFold(10)
-clf = SVC(kernel="rbf", C=10, class_weight="balanced")
-relatorio("SVM-RBF (grupo=gênero)", y_final, cross_val_predict(clf, Xs, y_final, cv=gkf, groups=genus))
+relatorio(NOME + " (grupo=gênero)", y_final,
+          cross_val_predict(novo_classificador(), Xs, y_final, cv=GroupKFold(10), groups=genus))
 
 # ---------- 7. Modelo final salvo para consultas ----------
-modelo_final = fit_model(Xs, y_final)
-joblib.dump({"model": modelo_final, "scaler": scaler}, OUT + "modelo.joblib")
-print("Modelo salvo em", OUT + "modelo.joblib")
+joblib.dump({"model": fit_model(Xs, y_final), "scaler": scaler}, OUT + "modelo.joblib")
+print("\nModelo salvo em", OUT + "modelo.joblib")
